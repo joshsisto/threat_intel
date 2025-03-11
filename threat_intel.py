@@ -6,6 +6,9 @@ import datetime
 import hashlib
 import re
 import logging
+import csv
+import traceback
+from io import StringIO
 from colorama import init, Fore, Style
 
 # Initialize colorama for colored terminal output
@@ -29,6 +32,10 @@ class IntelligenceFeedApp:
         self.conn = sqlite3.connect(self.db_name)
         self.cursor = self.conn.cursor()
         self.conn.execute("PRAGMA journal_mode=WAL;")  # Enable WAL mode
+        
+        # Configure logging level
+        logging.getLogger().setLevel(logging.DEBUG)  # Set to DEBUG for more verbose logging
+        
         self.create_tables()
         self.start_time = datetime.datetime.now()
         logger.info(f"{Fore.GREEN}Threat Intelligence Feed Application started{Style.RESET_ALL}")
@@ -51,10 +58,11 @@ class IntelligenceFeedApp:
             CREATE TABLE IF NOT EXISTS threats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER,
-                threat_type TEXT,  -- e.g., "malware_host", "malware_url", "ip_blocklist"
-                value TEXT,      -- The actual threat data (host, URL, IP)
+                threat_type TEXT,  -- e.g., "url", "domain", "ip", "ip_port", "cidr"
+                value TEXT,      -- The actual threat data (URL, domain, IP, IP:port, CIDR)
                 first_seen TIMESTAMP,
                 last_seen TIMESTAMP,
+                UNIQUE(threat_type, value) ON CONFLICT IGNORE,
                 FOREIGN KEY (source_id) REFERENCES sources (id)
             )
         """)
@@ -73,7 +81,7 @@ class IntelligenceFeedApp:
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_source_type_value ON threats (source_id, threat_type, value)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_value ON threats (value)")  # Add this if you query by value alone
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_raw_data_hash ON raw_data (hash)")
-
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_type ON threats (threat_type)")  # Add index for querying by threat type
 
         self.conn.commit()
         logger.info("Database tables created or verified")
@@ -106,9 +114,24 @@ class IntelligenceFeedApp:
         start_time = time.time()
         try:
             logger.info(f"Downloading data from {url}")
-            response = requests.get(url, timeout=30)  # Added timeout
+            
+            # For ThreatFox CSV downloads, we need to add a User-Agent header
+            headers = {
+                'User-Agent': 'ThreatIntelCollector/1.0',
+            }
+            
+            # Some ThreatFox endpoints might need authentication in the future
+            response = requests.get(url, timeout=60, headers=headers)  # Increased timeout for larger files
             response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
             elapsed = time.time() - start_time
+            
+            # Check the content type to handle CSV files properly
+            content_type = response.headers.get('Content-Type', '')
+            if 'csv' in content_type or url.endswith('.csv'):
+                logger.info(f"Downloaded CSV data - Content-Type: {content_type}")
+                # Log first 200 chars of response for debugging
+                logger.debug(f"First 200 chars of response: {response.text[:200]}")
+            
             logger.info(f"Download completed in {elapsed:.2f} seconds - Size: {len(response.text) // 1024} KB")
             return response.text
         except requests.exceptions.RequestException as e:
@@ -122,23 +145,204 @@ class IntelligenceFeedApp:
     def _clean_and_extract(self, source_name, raw_data):
         """Cleans and extracts threat data based on the source, optimized."""
         threats = []
-        if source_name == "urlhaus_hosts":
-            # Optimized regex for urlhaus_hosts
-            for match in re.finditer(r"^\s*[^#\s]+\s+([^#\s]+)", raw_data, re.MULTILINE):
-                threats.append(("malware_host", match.group(1)))
-
-        elif source_name == "urlhaus_text":
-            # Optimized regex for urlhaus_text (extract URLs)
-            for match in re.finditer(r"^(https?://\S+)", raw_data, re.MULTILINE):
-                threats.append(("malware_url", match.group(1)))
-
-        elif source_name == "feodotracker_ipblocklist":
-             # Optimized regex for feodotracker (extract IPs)
-            for match in re.finditer(r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", raw_data, re.MULTILINE):
-                threats.append(("ip_blocklist", match.group(1)))
         
-        logger.info(f"Extracted {len(threats)} potential threats from {source_name}")
+        # URL feeds
+        if source_name == "urlhaus_text":
+            # Process URLhaus text format (contains URLs)
+            for match in re.finditer(r"^(https?://\S+)", raw_data, re.MULTILINE):
+                url = match.group(1).strip()
+                if url:
+                    threats.append(("url", url))
+                    
+        elif source_name == "openphish":
+            # Process OpenPhish feed (one URL per line)
+            for line in raw_data.splitlines():
+                url = line.strip()
+                if url and url.startswith(('http://', 'https://')):
+                    threats.append(("url", url))
+                    
+        elif source_name == "vxvault":
+            # Process VXVault URL list
+            for line in raw_data.splitlines():
+                url = line.strip()
+                if url and url.startswith(('http://', 'https://')):
+                    threats.append(("url", url))
+
+        # IP feeds
+        elif source_name == "feodotracker_ipblocklist" or \
+             source_name == "binarydefense" or \
+             source_name == "emergingthreats" or \
+             source_name == "cinsscore" or \
+             source_name == "elliotech" or \
+             source_name == "stamparm" or \
+             source_name == "mirai":
+            # Process various IP blocklists (one IP per line)
+            for line in raw_data.splitlines():
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith(('#', '//', ';')):
+                    continue
+                
+                # Extract the first IP from the line
+                ip_match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+                if ip_match:
+                    ip = ip_match.group(1)
+                    if self._validate_ip(ip):
+                        threats.append(("ip", ip))
+        
+        # IP CIDR feeds
+        elif source_name == "spamhaus_drop" or \
+             source_name == "dshield" or \
+             source_name == "firehol":
+            # Process CIDR notation lists
+            for line in raw_data.splitlines():
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith(('#', '//', ';')):
+                    continue
+                
+                # Match CIDR notation (e.g., 192.168.1.0/24)
+                cidr_match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})", line)
+                if cidr_match:
+                    cidr = cidr_match.group(1)
+                    if self._validate_cidr(cidr):
+                        threats.append(("cidr", cidr))
+                
+        # ThreatFox feeds
+        elif source_name == "threatfox_urls" or source_name == "threatfox_domains" or source_name == "threatfox_ip_port":
+            # Process ThreatFox CSV data (all types use similar format)
+            try:
+                # Manual CSV parsing for better control
+                lines = raw_data.strip().split('\n')
+                logger.debug(f"Found {len(lines)} lines in {source_name}")
+                
+                # Log a few sample lines for debugging
+                if lines:
+                    sample_count = min(3, len(lines))
+                    logger.debug(f"Sample lines from {source_name}:")
+                    for i in range(sample_count):
+                        logger.debug(f"  Line {i+1}: {lines[i][:100]}...")
+                
+                for line in lines:
+                    # Skip empty lines
+                    if not line.strip():
+                        continue
+                    
+                    # Manual parsing to handle quoted CSV properly
+                    fields = []
+                    current_field = ""
+                    in_quotes = False
+                    
+                    for char in line:
+                        if char == '"':
+                            in_quotes = not in_quotes
+                        elif char == ',' and not in_quotes:
+                            fields.append(current_field.strip(' "'))
+                            current_field = ""
+                        else:
+                            current_field += char
+                    
+                    # Don't forget the last field
+                    if current_field:
+                        fields.append(current_field.strip(' "'))
+                    
+                    # Skip if we don't have enough fields
+                    if len(fields) < 3:
+                        logger.warning(f"Skipping line with insufficient fields: {line[:50]}...")
+                        continue
+                    
+                    # Extract the indicator (3rd field)
+                    indicator = fields[2].strip()
+                    
+                    if source_name == "threatfox_urls":
+                        if indicator and indicator.startswith(('http://', 'https://')):
+                            threats.append(("url", indicator))
+                    
+                    elif source_name == "threatfox_domains":
+                        if indicator and self._validate_domain(indicator):
+                            threats.append(("domain", indicator))
+                    
+                    elif source_name == "threatfox_ip_port":
+                        if indicator and ":" in indicator:
+                            ip_part = indicator.split(":")[0]
+                            if self._validate_ip(ip_part):
+                                threats.append(("ip_port", indicator))
+                                threats.append(("ip", ip_part))
+                
+            except Exception as e:
+                logger.error(f"Error parsing {source_name} data: {str(e)}")
+                logger.error(f"Exception details: {type(e).__name__}")
+                logger.error(traceback.format_exc())
+        
+        # Log extraction results
+        if threats:
+            threat_types = {}
+            for t_type, _ in threats:
+                threat_types[t_type] = threat_types.get(t_type, 0) + 1
+            
+            type_counts = ", ".join([f"{t_type}: {count}" for t_type, count in threat_types.items()])
+            logger.info(f"Extracted {len(threats)} indicators from {source_name} ({type_counts})")
+        else:
+            logger.warning(f"No threats extracted from {source_name}")
+            
         return threats
+        
+    def _validate_ip(self, ip):
+        """Validate if a string is a proper IP address."""
+        try:
+            # Basic pattern match first
+            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
+                return False
+            
+            # Check each octet
+            octets = ip.split('.')
+            return all(0 <= int(octet) <= 255 for octet in octets)
+        except (ValueError, AttributeError):
+            return False
+            
+    def _validate_domain(self, domain):
+        """Validate if a string is a proper domain name."""
+        try:
+            # Basic domain validation
+            if not domain or len(domain) > 255:
+                return False
+                
+            # Check for at least one dot and valid characters
+            if "." not in domain:
+                return False
+                
+            # Domain should not be an IP address
+            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", domain):
+                return False
+                
+            # Check for invalid characters
+            if not re.match(r"^[a-zA-Z0-9.-]+$", domain):
+                return False
+                
+            return True
+        except Exception:
+            return False
+            
+    def _validate_cidr(self, cidr):
+        """Validate if a string is a proper CIDR notation."""
+        try:
+            if not cidr or '/' not in cidr:
+                return False
+                
+            ip_part, prefix_part = cidr.split('/')
+            
+            # Validate IP part
+            if not self._validate_ip(ip_part):
+                return False
+                
+            # Validate prefix part (must be 0-32)
+            prefix = int(prefix_part)
+            if prefix < 0 or prefix > 32:
+                return False
+                
+            return True
+        except (ValueError, AttributeError):
+            return False
 
     def process_source(self, source_id, name, url, frequency):
         """Downloads, processes, and stores data from a single source."""
@@ -268,25 +472,30 @@ class IntelligenceFeedApp:
         self.cursor.execute("SELECT threat_type, COUNT(*) FROM threats GROUP BY threat_type")
         threat_types = self.cursor.fetchall()
         
-        self.cursor.execute("SELECT name, last_scan FROM sources")
+        self.cursor.execute("SELECT s.name, s.last_scan, COUNT(t.id) as count FROM sources s LEFT JOIN threats t ON s.id = t.source_id GROUP BY s.id")
         sources = self.cursor.fetchall()
         
         logger.info(f"Total threats: {threat_count}")
         for threat_type, count in threat_types:
             logger.info(f"  {threat_type}: {count}")
             
-        logger.info("Source last scan times:")
-        for name, last_scan in sources:
-            logger.info(f"  {name}: {last_scan}")
+        logger.info("Source statistics:")
+        for name, last_scan, count in sources:
+            if last_scan:
+                logger.info(f"  {name}: {count} indicators, last scan: {last_scan}")
+            else:
+                logger.info(f"  {name}: {count} indicators, not yet scanned")
         
         logger.info(f"{Fore.CYAN}------------------------{Style.RESET_ALL}")
 
     def run_scheduler(self):
         """Sets up and runs the scheduler for periodic scanning."""
-        # Schedule the scan_sources function to run every minute.  This is more frequent than
-        # any of our scheduled tasks, but it allows us to check if *any* task needs to run.
         logger.info("Setting up scheduler to check sources every minute")
         schedule.every(1).minutes.do(self.scan_sources)
+        
+        # Run an initial scan immediately
+        logger.info("Running initial scan...")
+        self.scan_sources()
 
         try:
             while True:
@@ -335,10 +544,38 @@ if __name__ == "__main__":
     
     app = IntelligenceFeedApp()
 
-    # Add the intelligence sources
-    app.add_source("urlhaus_hosts", "https://urlhaus.abuse.ch/downloads/hostfile/", 3600)  # 1 hour
-    app.add_source("urlhaus_text", "https://urlhaus.abuse.ch/downloads/text/", 1800)  # 30 minutes
-    app.add_source("feodotracker_ipblocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", 86400)  # 1 day
+    # Define check frequencies for different categories
+    # These can be easily modified to your preferred values
+    FREQUENCY = {
+        "QUICK": 300,       # 5 minutes - for rapidly changing feeds
+        "STANDARD": 600,    # 10 minutes - default for most feeds
+        "SLOW": 1800,       # 30 minutes - for slower-changing feeds
+        "DAILY": 86400      # 24 hours - for feeds that update once per day
+    }
+
+    # URL Feeds - typically update more frequently
+    app.add_source("urlhaus_text", "https://urlhaus.abuse.ch/downloads/text/", FREQUENCY["STANDARD"])
+    app.add_source("openphish", "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", FREQUENCY["STANDARD"])
+    app.add_source("vxvault", "http://vxvault.net/URL_List.php", FREQUENCY["STANDARD"])
+    
+    # IP Feeds - typically update less frequently
+    app.add_source("feodotracker_ipblocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", FREQUENCY["STANDARD"])
+    app.add_source("binarydefense", "https://www.binarydefense.com/banlist.txt", FREQUENCY["STANDARD"])
+    app.add_source("emergingthreats", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", FREQUENCY["STANDARD"])
+    app.add_source("cinsscore", "https://cinsscore.com/list/ci-badguys.txt", FREQUENCY["STANDARD"])
+    app.add_source("elliotech", "https://cdn.ellio.tech/community-feed", FREQUENCY["SLOW"])
+    app.add_source("stamparm", "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/6.txt", FREQUENCY["SLOW"])
+    app.add_source("mirai", "https://mirai.security.gives/data/ip_list.txt", FREQUENCY["STANDARD"])
+    
+    # IP CIDR Feeds - typically update less frequently
+    app.add_source("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt", FREQUENCY["SLOW"])
+    app.add_source("dshield", "https://dshield.org/block.txt", FREQUENCY["STANDARD"])
+    app.add_source("firehol", "https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset", FREQUENCY["DAILY"])
+    
+    # ThreatFox Feeds - contain recent threats, check frequently
+    app.add_source("threatfox_urls", "https://threatfox.abuse.ch/export/csv/urls/recent/", FREQUENCY["STANDARD"])
+    app.add_source("threatfox_domains", "https://threatfox.abuse.ch/export/csv/domains/recent/", FREQUENCY["STANDARD"])
+    app.add_source("threatfox_ip_port", "https://threatfox.abuse.ch/export/csv/ip-port/recent/", FREQUENCY["STANDARD"])
 
     # Start the scheduler
     app.run_scheduler()

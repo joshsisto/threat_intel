@@ -117,6 +117,10 @@ class ThreatQuerier:
             return self._export_results(results, filename, format)
         return None
     
+    def get_cidr_threats(self, export=False, filename=None, format="txt"):
+        """Retrieves all CIDR-based threats."""
+        return self.get_threats_by_type("cidr", export, filename, format)
+    
     def get_threats_by_source(self, source_name, export=False, filename=None, format="txt"):
         """Retrieves threats from a specific source."""
         self.cursor.execute("""
@@ -278,13 +282,14 @@ def parse_arguments():
     # Query type
     query_group = parser.add_mutually_exclusive_group(required=True)
     query_group.add_argument("--all", action="store_true", help="Get all threats")
-    query_group.add_argument("--type", type=str, help="Get threats by type (e.g., malware_host)")
+    query_group.add_argument("--type", type=str, help="Get threats by type (e.g., url, domain, ip, ip_port, cidr)")
     query_group.add_argument("--source", type=str, help="Get threats by source name")
     query_group.add_argument("--since", type=str, help="Get threats since datetime (YYYY-MM-DD HH:MM:SS)")
     query_group.add_argument("--search", type=str, help="Search for specific term in threat values")
     query_group.add_argument("--counts", action="store_true", help="Get threat counts by source")
     query_group.add_argument("--export-all", action="store_true", help="Export all data")
     query_group.add_argument("--ioc-list", action="store_true", help="Export IOC list")
+    query_group.add_argument("--cidr", action="store_true", help="Get all CIDR threats")
     query_group.add_argument("--custom", type=str, help="Run custom SQL query")
     
     # Export options
@@ -321,6 +326,40 @@ if __name__ == "__main__":
         elif args.since:
             querier.get_threats_since(args.since, export=args.export, filename=args.filename, format=args.format)
         
+        elif args.search:
+            querier.search_threats(args.search, export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.counts:
+            querier.get_threat_counts_by_source(export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.export_all:
+            querier.export_all_data(format=args.format)
+        
+        elif args.ioc_list:
+            querier.export_ioc_list(threat_type=args.ioc_type, filename=args.filename)
+            
+        elif args.cidr:
+            querier.get_cidr_threats(export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.custom:
+            querier.custom_query(args.custom, export=args.export, filename=args.filename, format=args.format)
+        elif args.search:
+            querier.search_threats(args.search, export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.counts:
+            querier.get_threat_counts_by_source(export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.export_all:
+            querier.export_all_data(format=args.format)
+        
+        elif args.ioc_list:
+            querier.export_ioc_list(threat_type=args.ioc_type, filename=args.filename)
+            
+        elif args.cidr:
+            querier.get_cidr_threats(export=args.export, filename=args.filename, format=args.format)
+        
+        elif args.custom:
+            querier.custom_query(args.custom, export=args.export, filename=args.filename, format=args.format)
         elif args.search:
             querier.search_threats(args.search, export=args.export, filename=args.filename, format=args.format)
         
