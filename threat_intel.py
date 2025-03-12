@@ -8,6 +8,7 @@ import re
 import logging
 import csv
 import traceback
+import os
 from io import StringIO
 from colorama import init, Fore, Style
 
@@ -32,9 +33,16 @@ class IntelligenceFeedApp:
         self.conn = sqlite3.connect(self.db_name)
         self.cursor = self.conn.cursor()
         self.conn.execute("PRAGMA journal_mode=WAL;")  # Enable WAL mode
+        self.conn.execute("PRAGMA synchronous=NORMAL;")  # Slightly faster operation while maintaining data integrity
         
         # Configure logging level
         logging.getLogger().setLevel(logging.DEBUG)  # Set to DEBUG for more verbose logging
+        
+        # Create exports directory if it doesn't exist
+        self.export_dir = "exports"
+        if not os.path.exists(self.export_dir):
+            os.makedirs(self.export_dir)
+            logger.info(f"Created exports directory: {self.export_dir}")
         
         self.create_tables()
         self.start_time = datetime.datetime.now()
@@ -376,42 +384,44 @@ class IntelligenceFeedApp:
         extraction_time = time.time() - extraction_start
         logger.info(f"Threat extraction completed in {extraction_time:.2f} seconds")
 
-        # --- Bulk Insert Optimization ---
+        # --- Process threats with deduplication ---
         db_start = time.time()
         now = datetime.datetime.now()
-        bulk_insert_data = []  # List to accumulate data for bulk insert
-        bulk_update_data = []
+        new_count = 0
+        update_count = 0
         
         for threat_type, threat_value in threats:
-            self.cursor.execute("""
-                SELECT id FROM threats
-                WHERE source_id = ? AND threat_type = ? AND value = ?
-            """, (source_id, threat_type, threat_value))
+            try:
+                # First try to insert - will fail if there's a duplicate
+                self.cursor.execute("""
+                    INSERT INTO threats (source_id, threat_type, value, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (source_id, threat_type, threat_value, now, now))
+                new_count += 1
+            except sqlite3.IntegrityError:
+                # If it's a duplicate, update the last_seen time and add the source if different
+                self.cursor.execute("""
+                    UPDATE threats 
+                    SET last_seen = ?,
+                        source_id = CASE
+                            WHEN source_id != ? THEN ? 
+                            ELSE source_id
+                        END
+                    WHERE threat_type = ? AND value = ?
+                """, (now, source_id, source_id, threat_type, threat_value))
+                update_count += 1
 
-            existing_threat = self.cursor.fetchone()
-
-            if existing_threat:
-               # Prepare for bulk update
-               bulk_update_data.append((now, existing_threat[0]))
-            else:
-                # Prepare for bulk insert
-                bulk_insert_data.append((source_id, threat_type, threat_value, now, now))
-
-        # Perform bulk insert
-        if bulk_insert_data:
-            self.cursor.executemany("""
-                INSERT INTO threats (source_id, threat_type, value, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?)
-            """, bulk_insert_data)
-            logger.info(f"  {Fore.GREEN}Added {len(bulk_insert_data)} new threats for {name}{Style.RESET_ALL}")
-
-
-        if bulk_update_data:
-            self.cursor.executemany("UPDATE threats SET last_seen = ? WHERE id = ?", bulk_update_data)
-            logger.info(f"  {Fore.BLUE}Updated {len(bulk_update_data)} existing threats for {name}{Style.RESET_ALL}")
+        # Commit after all inserts and updates
+        self.conn.commit()
+        
+        if new_count > 0:
+            logger.info(f"  {Fore.GREEN}Added {new_count} new threats from {name}{Style.RESET_ALL}")
+        
+        if update_count > 0:
+            logger.info(f"  {Fore.BLUE}Updated {update_count} existing threats from {name}{Style.RESET_ALL}")
 
         self.cursor.execute("UPDATE sources SET last_scan = ? WHERE id = ?", (now, source_id))
-        self.conn.commit() #commit all the changes
+        self.conn.commit()
         
         db_time = time.time() - db_start
         elapsed = time.time() - process_start
@@ -428,8 +438,12 @@ class IntelligenceFeedApp:
         sources = self.cursor.fetchall()
 
         scan_count = 0
+        total_sources = len(sources)
+        sources_checked = 0
+        
         for source_id, name, url, frequency, last_scan in sources:
             next_scan_due = None
+            sources_checked += 1
             
             if last_scan is None:
                 # First time scanning this source
@@ -456,6 +470,13 @@ class IntelligenceFeedApp:
         
         if scan_count == 0:
             logger.info("No sources due for scanning")
+        else:
+            logger.info(f"Completed scanning {scan_count} sources")
+            
+        # Check if this is the final source and if any scans were performed
+        if sources_checked == total_sources and scan_count > 0:
+            logger.info("All sources checked. Running auto-export...")
+            self.export_threat_data()
             
         # Display database statistics every hour
         hour_passed = int(uptime.total_seconds()) % 3600 < 60  # Check if we just passed an hour mark
@@ -488,10 +509,173 @@ class IntelligenceFeedApp:
         
         logger.info(f"{Fore.CYAN}------------------------{Style.RESET_ALL}")
 
+    def export_threat_data(self):
+        """
+        Exports threat data to master files based on threat type.
+        Creates one file each for URLs, domains, IPs, and CIDR ranges,
+        with a timestamp header.
+        """
+        export_dir = "exports"
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+            logger.info(f"Created exports directory: {export_dir}")
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Create fixed file paths for master files
+        url_file = os.path.join(export_dir, "urls_master.txt")
+        domain_file = os.path.join(export_dir, "domains_master.txt")
+        ip_file = os.path.join(export_dir, "ips_master.txt")
+        cidr_file = os.path.join(export_dir, "cidrs_master.txt")
+        
+        # Create a backup of the current master files before overwriting them
+        self._create_backups([url_file, domain_file, ip_file, cidr_file])
+        
+        # Dictionary to track counts
+        counts = {
+            "url": 0,
+            "domain": 0,
+            "ip": 0,
+            "cidr": 0
+        }
+        
+        # Common header with timestamp and information
+        header_template = """# Threat Intelligence Export - {threat_type}
+# Generated on: {timestamp}
+# Total Count: {count}
+# ----------------------------------------------------------
+"""
+        
+        # Export URLs
+        self.cursor.execute("SELECT value FROM threats WHERE threat_type = 'url' ORDER BY value")
+        urls = self.cursor.fetchall()
+        counts["url"] = len(urls)
+        with open(url_file, 'w') as f:
+            f.write(header_template.format(
+                threat_type="URLs",
+                timestamp=timestamp,
+                count=counts["url"]
+            ))
+            for row in urls:
+                f.write(f"{row[0]}\n")
+        
+        # Export domains
+        self.cursor.execute("SELECT value FROM threats WHERE threat_type = 'domain' ORDER BY value")
+        domains = self.cursor.fetchall()
+        counts["domain"] = len(domains)
+        with open(domain_file, 'w') as f:
+            f.write(header_template.format(
+                threat_type="Domains",
+                timestamp=timestamp,
+                count=counts["domain"]
+            ))
+            for row in domains:
+                f.write(f"{row[0]}\n")
+        
+        # Export IPs
+        self.cursor.execute("SELECT value FROM threats WHERE threat_type = 'ip' ORDER BY value")
+        ips = self.cursor.fetchall()
+        counts["ip"] = len(ips)
+        with open(ip_file, 'w') as f:
+            f.write(header_template.format(
+                threat_type="IP Addresses",
+                timestamp=timestamp,
+                count=counts["ip"]
+            ))
+            for row in ips:
+                f.write(f"{row[0]}\n")
+        
+        # Export CIDRs
+        self.cursor.execute("SELECT value FROM threats WHERE threat_type = 'cidr' ORDER BY value")
+        cidrs = self.cursor.fetchall()
+        counts["cidr"] = len(cidrs)
+        with open(cidr_file, 'w') as f:
+            f.write(header_template.format(
+                threat_type="CIDR Ranges",
+                timestamp=timestamp,
+                count=counts["cidr"]
+            ))
+            for row in cidrs:
+                f.write(f"{row[0]}\n")
+        
+        # Log export results
+        logger.info(f"{Fore.GREEN}Threat data exported successfully{Style.RESET_ALL}")
+        logger.info(f"URLs: {counts['url']} exported to {url_file}")
+        logger.info(f"Domains: {counts['domain']} exported to {domain_file}")
+        logger.info(f"IPs: {counts['ip']} exported to {ip_file}")
+        logger.info(f"CIDRs: {counts['cidr']} exported to {cidr_file}")
+        
+        return counts
+
+    def _create_backups(self, files, max_backups=5):
+        """
+        Creates backup copies of existing master files before they are overwritten.
+        
+        Args:
+            files: List of file paths to back up
+            max_backups: Maximum number of backup files to keep
+        """
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        for file_path in files:
+            if not os.path.exists(file_path):
+                continue
+                
+            # Create backup filename
+            backup_file = f"{file_path}.{timestamp}.bak"
+            
+            try:
+                # Copy the file
+                with open(file_path, 'r') as src:
+                    with open(backup_file, 'w') as dst:
+                        dst.write(src.read())
+                logger.debug(f"Created backup: {backup_file}")
+            except Exception as e:
+                logger.error(f"Error creating backup of {file_path}: {e}")
+        
+        # Cleanup old backups
+        for file_path in files:
+            base_name = os.path.basename(file_path)
+            dir_name = os.path.dirname(file_path)
+            
+            # Find all backup files for this master file
+            backup_pattern = f"{base_name}.*.bak"
+            backups = []
+            
+            for filename in os.listdir(dir_name):
+                if fnmatch.fnmatch(filename, backup_pattern):
+                    full_path = os.path.join(dir_name, filename)
+                    backups.append((full_path, os.path.getmtime(full_path)))
+            
+            # Sort by modification time (newest first)
+            backups.sort(key=lambda x: x[1], reverse=True)
+            
+            # Remove older backups beyond the keep limit
+            for backup_path, _ in backups[max_backups:]:
+                try:
+                    os.remove(backup_path)
+                    logger.debug(f"Removed old backup: {backup_path}")
+                except OSError as e:
+                    logger.error(f"Error removing old backup {backup_path}: {e}")
+
+    def close_connection(self):
+        """Closes the database connection."""
+        if hasattr(self, 'conn') and self.conn:
+            self.conn.close()
+            logger.info(f"{Fore.GREEN}Database connection closed, application shutting down{Style.RESET_ALL}")
+
+    def __del__(self):
+        """Destructor to ensure database connection is closed properly."""
+        self.close_connection()
+        
     def run_scheduler(self):
         """Sets up and runs the scheduler for periodic scanning."""
         logger.info("Setting up scheduler to check sources every minute")
         schedule.every(1).minutes.do(self.scan_sources)
+        
+        # Schedule daily export at midnight
+        schedule.every().day.at("00:00").do(self.export_threat_data)
+        logger.info("Scheduled automatic daily export at midnight")
         
         # Run an initial scan immediately
         logger.info("Running initial scan...")
@@ -505,40 +689,11 @@ class IntelligenceFeedApp:
             logger.info(f"{Fore.YELLOW}Keyboard interrupt received, shutting down...{Style.RESET_ALL}")
             self.close_connection()
 
-    def close_connection(self):
-        """Closes the database connection."""
-        self.conn.close()
-        logger.info(f"{Fore.GREEN}Database connection closed, application shutting down{Style.RESET_ALL}")
-
-    def query_threats(self, query):
-        """Executes an arbitrary SQL query against the threats table and prints the results."""
-        logger.info(f"Executing query: {query}")
-        try:
-            start_time = time.time()
-            self.cursor.execute(query)
-            results = self.cursor.fetchall()
-            query_time = time.time() - start_time
-            
-            logger.info(f"Query returned {len(results)} results in {query_time:.2f} seconds")
-
-            # Print column headers (if available)
-            if self.cursor.description:
-                headers = [col[0] for col in self.cursor.description]
-                header_row = "| " + " | ".join(headers) + " |"
-                separator = "|" + "---|" * len(headers)
-                
-                print(header_row)
-                print(separator)
-
-            # Print the results
-            for row in results:
-                formatted_row = [str(item).replace("\n", "\\n") for item in row]  # Handle newlines
-                print("| " + " | ".join(formatted_row) + " |")
-
-        except sqlite3.Error as e:
-            logger.error(f"{Fore.RED}Database error: {e}{Style.RESET_ALL}")
-
 if __name__ == "__main__":
+    # Import missing modules
+    import fnmatch
+    import signal
+    
     print(f"{Fore.GREEN}Starting Threat Intelligence Feed Application{Style.RESET_ALL}")
     print("Press Ctrl+C to exit")
     
@@ -577,6 +732,24 @@ if __name__ == "__main__":
     app.add_source("threatfox_domains", "https://threatfox.abuse.ch/export/csv/domains/recent/", FREQUENCY["STANDARD"])
     app.add_source("threatfox_ip_port", "https://threatfox.abuse.ch/export/csv/ip-port/recent/", FREQUENCY["STANDARD"])
 
-    # Start the scheduler
-    app.run_scheduler()
-    app.close_connection()
+    # Set up signal handler for graceful shutdown
+    def signal_handler(sig, frame):
+        print(f"\n{Fore.YELLOW}Received signal {sig}, shutting down gracefully...{Style.RESET_ALL}")
+        app.close_connection()
+        sys.exit(0)
+        
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        # Start the scheduler
+        app.run_scheduler()
+    except KeyboardInterrupt:
+        # This is handled by the signal handler now
+        pass
+    except Exception as e:
+        logger.error(f"{Fore.RED}Unhandled exception: {e}{Style.RESET_ALL}")
+        logger.error(traceback.format_exc())
+    finally:
+        app.close_connection()
