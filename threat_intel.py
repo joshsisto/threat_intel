@@ -45,6 +45,10 @@ class IntelligenceFeedApp:
             logger.info(f"Created exports directory: {self.export_dir}")
         
         self.create_tables()
+        
+        # Run deduplication on startup
+        self.deduplicate_threats()
+        
         self.start_time = datetime.datetime.now()
         logger.info(f"{Fore.GREEN}Threat Intelligence Feed Application started{Style.RESET_ALL}")
         logger.info(f"Database initialized: {self.db_name}")
@@ -62,6 +66,7 @@ class IntelligenceFeedApp:
             )
         """)
 
+        # Modified threat table definition with proper uniqueness constraint
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS threats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +75,7 @@ class IntelligenceFeedApp:
                 value TEXT,      -- The actual threat data (URL, domain, IP, IP:port, CIDR)
                 first_seen TIMESTAMP,
                 last_seen TIMESTAMP,
-                UNIQUE(threat_type, value) ON CONFLICT IGNORE,
+                UNIQUE(threat_type, value) ON CONFLICT REPLACE,  -- Changed from IGNORE to REPLACE
                 FOREIGN KEY (source_id) REFERENCES sources (id)
             )
         """)
@@ -87,12 +92,49 @@ class IntelligenceFeedApp:
         """)
         # --- Add Indexes ---
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_source_type_value ON threats (source_id, threat_type, value)")
-        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_value ON threats (value)")  # Add this if you query by value alone
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_value ON threats (value)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_raw_data_hash ON raw_data (hash)")
-        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_type ON threats (threat_type)")  # Add index for querying by threat type
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_threats_type ON threats (threat_type)")
 
         self.conn.commit()
         logger.info("Database tables created or verified")
+
+    def deduplicate_threats(self):
+        """Removes duplicate entries from the threats table by keeping only the most recent entry."""
+        logger.info(f"{Fore.YELLOW}Starting deduplication of threats table...{Style.RESET_ALL}")
+        
+        # Create a temporary table to store unique threat entries
+        self.cursor.execute("""
+            CREATE TEMPORARY TABLE threats_dedup AS
+            SELECT MAX(id) as id, threat_type, value, MAX(last_seen) as last_seen
+            FROM threats
+            GROUP BY threat_type, value
+        """)
+        
+        # Count how many duplicates will be removed
+        self.cursor.execute("""
+            SELECT COUNT(*) FROM threats
+            WHERE id NOT IN (SELECT id FROM threats_dedup)
+        """)
+        duplicate_count = self.cursor.fetchone()[0]
+        
+        if duplicate_count > 0:
+            logger.info(f"{Fore.GREEN}Found {duplicate_count} duplicate threat entries to remove{Style.RESET_ALL}")
+            
+            # Delete duplicates
+            self.cursor.execute("""
+                DELETE FROM threats
+                WHERE id NOT IN (SELECT id FROM threats_dedup)
+            """)
+            
+            self.conn.commit()
+            logger.info(f"{Fore.GREEN}Successfully removed {duplicate_count} duplicate threat entries{Style.RESET_ALL}")
+        else:
+            logger.info("No duplicate threats found")
+        
+        # Drop the temporary table
+        self.cursor.execute("DROP TABLE threats_dedup")
+        self.conn.commit()
 
     def add_source(self, name, url, frequency):
         """Adds a new intelligence source to the database."""
@@ -372,7 +414,7 @@ class IntelligenceFeedApp:
             
             # Update the last_scan time even if data hasn't changed
             self.cursor.execute("UPDATE sources SET last_scan = ? WHERE id = ?", 
-                               (datetime.datetime.now(), source_id))
+                            (datetime.datetime.now(), source_id))
             self.conn.commit()
             
             elapsed = time.time() - process_start
@@ -384,41 +426,33 @@ class IntelligenceFeedApp:
         extraction_time = time.time() - extraction_start
         logger.info(f"Threat extraction completed in {extraction_time:.2f} seconds")
 
-        # --- Process threats with deduplication ---
+        # --- Process threats with better deduplication ---
         db_start = time.time()
         now = datetime.datetime.now()
-        new_count = 0
-        update_count = 0
+        processed_count = 0
+        
+        # Use a transaction for better performance
+        self.conn.execute("BEGIN TRANSACTION")
         
         for threat_type, threat_value in threats:
-            try:
-                # First try to insert - will fail if there's a duplicate
-                self.cursor.execute("""
-                    INSERT INTO threats (source_id, threat_type, value, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (source_id, threat_type, threat_value, now, now))
-                new_count += 1
-            except sqlite3.IntegrityError:
-                # If it's a duplicate, update the last_seen time and add the source if different
-                self.cursor.execute("""
-                    UPDATE threats 
-                    SET last_seen = ?,
-                        source_id = CASE
-                            WHEN source_id != ? THEN ? 
-                            ELSE source_id
-                        END
-                    WHERE threat_type = ? AND value = ?
-                """, (now, source_id, source_id, threat_type, threat_value))
-                update_count += 1
+            # Get normalized value to avoid duplicates with different formatting
+            normalized_value = self._normalize_value(threat_type, threat_value)
+            
+            # Use REPLACE conflict resolution strategy to update existing records
+            self.cursor.execute("""
+                INSERT OR REPLACE INTO threats (source_id, threat_type, value, first_seen, last_seen)
+                VALUES (
+                    ?, ?, ?, 
+                    COALESCE((SELECT first_seen FROM threats WHERE threat_type = ? AND value = ?), ?),
+                    ?
+                )
+            """, (source_id, threat_type, normalized_value, threat_type, normalized_value, now, now))
+            processed_count += 1
 
-        # Commit after all inserts and updates
+        # Commit the transaction
         self.conn.commit()
         
-        if new_count > 0:
-            logger.info(f"  {Fore.GREEN}Added {new_count} new threats from {name}{Style.RESET_ALL}")
-        
-        if update_count > 0:
-            logger.info(f"  {Fore.BLUE}Updated {update_count} existing threats from {name}{Style.RESET_ALL}")
+        logger.info(f"  {Fore.GREEN}Processed {processed_count} threats from {name}{Style.RESET_ALL}")
 
         self.cursor.execute("UPDATE sources SET last_scan = ? WHERE id = ?", (now, source_id))
         self.conn.commit()
@@ -427,6 +461,40 @@ class IntelligenceFeedApp:
         elapsed = time.time() - process_start
         logger.info(f"Database operations completed in {db_time:.2f} seconds")
         logger.info(f"{Fore.GREEN}Finished processing {name} in {elapsed:.2f} seconds{Style.RESET_ALL}")
+
+    def _normalize_value(self, threat_type, value):
+        """Normalizes threat values to prevent duplicates with different formatting."""
+        normalized = value.strip()
+        
+        if threat_type == "url":
+            # Normalize URLs
+            normalized = normalized.lower()
+            # Remove trailing slashes
+            if normalized.endswith('/'):
+                normalized = normalized[:-1]
+            # Ensure http:// prefix for consistency
+            if not normalized.startswith(('http://', 'https://')):
+                normalized = 'http://' + normalized
+        
+        elif threat_type == "domain":
+            # Normalize domains
+            normalized = normalized.lower()
+            # Remove any trailing dots
+            if normalized.endswith('.'):
+                normalized = normalized[:-1]
+            # Remove any www. prefix
+            if normalized.startswith('www.'):
+                normalized = normalized[4:]
+        
+        elif threat_type == "ip" or threat_type == "ip_port":
+            # For IPs, just strip and lowercase
+            normalized = normalized.lower()
+        
+        elif threat_type == "cidr":
+            # Normalize CIDR notation
+            normalized = normalized.lower()
+            
+        return normalized        
 
     def scan_sources(self):
         """Scans all sources based on their defined frequency."""

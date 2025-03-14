@@ -173,3 +173,5 @@ cython_debug/
 # custom
 *.db*
 /exports
+nohup.out
+.stignore
