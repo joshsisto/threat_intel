@@ -36,7 +36,7 @@ class IntelligenceFeedApp:
         self.conn.execute("PRAGMA synchronous=NORMAL;")  # Slightly faster operation while maintaining data integrity
         
         # Configure logging level
-        logging.getLogger().setLevel(logging.DEBUG)  # Set to DEBUG for more verbose logging
+        logging.getLogger().setLevel(logging.INFO)  # Set to DEBUG for more verbose logging
         
         # Create exports directory if it doesn't exist
         self.export_dir = "exports"
