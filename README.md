@@ -41,6 +41,10 @@ Run the application with:
 python -m threat_intel_collector.main
 ```
 
+```
+nohup ./start_threat_intel.sh &
+```
+
 The application will:
 1. Initialize the database
 2. Add default threat intelligence sources
@@ -66,6 +70,10 @@ The application exports data to the following files:
 - `exports/domains_master.txt` - Domain names
 - `exports/ips_master.txt` - IP addresses
 - `exports/cidrs_master.txt` - CIDR ranges
+
+## Updated Threat Feeds Are Posted On My Website
+
+[joshsisto.com](https://joshsisto.com/projects.html)
 
 ## License
 
