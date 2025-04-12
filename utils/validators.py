@@ -105,8 +105,17 @@ def validate_url(url):
         if not url.startswith(('http://', 'https://')):
             return False
             
-        # More specific validation could be added here
+        # Check for valid URL format with more detailed regex
+        url_pattern = r"^https?://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)$"
+        if not re.match(url_pattern, url):
+            return False
         
+        # Limit URL length to prevent database issues
+        if len(url) > 2048:  # Common max URL length
+            logger.warning(f"URL too long ({len(url)} chars): {url[:100]}...")
+            return False
+            
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug(f"URL validation error: {str(e)}")
         return False
