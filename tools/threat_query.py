@@ -7,8 +7,13 @@ from datetime import datetime
 import argparse
 
 class ThreatQuerier:
-    def __init__(self, db_name="threat_intel.db"):
-        self.db_name = db_name
+    def __init__(self, db_name=None):
+        # Use provided db_name or get from environment variable or use default
+        if db_name is None:
+            self.db_name = os.environ.get("THREAT_INTEL_DB_NAME", "threat_intel.db")
+        else:
+            self.db_name = db_name
+        
         self.conn = sqlite3.connect(self.db_name)
         self.conn.row_factory = sqlite3.Row  # Enable column access by name
         self.cursor = self.conn.cursor()
@@ -302,14 +307,15 @@ def parse_arguments():
     parser.add_argument("--ioc-type", type=str, help="Filter IOC list by threat type")
     
     # Database options
-    parser.add_argument("--db", type=str, default="threat_intel.db", help="Database file path")
+    # Default is now handled by ThreatQuerier constructor if args.db is None
+    parser.add_argument("--db", type=str, help="Database file path (overrides THREAT_INTEL_DB_NAME)")
     
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_arguments()
     
-    # Initialize querier with specified database
+    # Initialize querier with specified database (or None to use env/default)
     querier = ThreatQuerier(db_name=args.db)
     
     try:

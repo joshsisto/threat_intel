@@ -2,6 +2,8 @@
 Source definitions for the threat intelligence application.
 """
 import logging
+import json
+import os
 from colorama import Fore, Style
 
 logger = logging.getLogger(__name__)
@@ -15,37 +17,54 @@ FREQUENCY = {
     "DAILY": 86400      # 24 hours - for feeds that update once per day
 }
 
+SOURCES_FILE_PATH = os.path.join(os.path.dirname(__file__), "sources.json")
+
 def add_default_sources(app):
     """
-    Add default sources to the application.
+    Add default sources to the application from the sources.json file.
     
     Args:
         app: IntelligenceFeedApp instance
     """
-    logger.info(f"{Fore.CYAN}Adding default threat intelligence sources{Style.RESET_ALL}")
+    logger.info(f"{Fore.CYAN}Loading threat intelligence sources from {SOURCES_FILE_PATH}{Style.RESET_ALL}")
     
-    # URL Feeds - typically update more frequently
-    app.add_source("urlhaus_text", "https://urlhaus.abuse.ch/downloads/text/", FREQUENCY["STANDARD"])
-    app.add_source("openphish", "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", FREQUENCY["STANDARD"])
-    app.add_source("vxvault", "http://vxvault.net/URL_List.php", FREQUENCY["STANDARD"])
+    if not os.path.exists(SOURCES_FILE_PATH):
+        logger.warning(f"{Fore.YELLOW}Warning: Sources file not found at {SOURCES_FILE_PATH}. No sources will be loaded.{Style.RESET_ALL}")
+        return
+
+    try:
+        with open(SOURCES_FILE_PATH, 'r') as f:
+            sources_data = json.load(f)
+    except json.JSONDecodeError:
+        logger.error(f"{Fore.RED}Error: Could not decode JSON from {SOURCES_FILE_PATH}. Ensure it is valid JSON.{Style.RESET_ALL}")
+        return
+    except Exception as e:
+        logger.error(f"{Fore.RED}Error reading sources file {SOURCES_FILE_PATH}: {e}{Style.RESET_ALL}")
+        return
+
+    if not sources_data:
+        logger.warning(f"{Fore.YELLOW}Warning: Sources file {SOURCES_FILE_PATH} is empty. No sources will be loaded.{Style.RESET_ALL}")
+        return
+
+    count_added = 0
+    for source in sources_data:
+        name = source.get("name")
+        url = source.get("url")
+        frequency_alias = source.get("frequency_alias")
+
+        if not all([name, url, frequency_alias]):
+            logger.warning(f"{Fore.YELLOW}Skipping source due to missing 'name', 'url', or 'frequency_alias': {source}{Style.RESET_ALL}")
+            continue
+
+        actual_frequency = FREQUENCY.get(frequency_alias.upper())
+        if actual_frequency is None:
+            logger.warning(f"{Fore.YELLOW}Skipping source '{name}': Invalid frequency_alias '{frequency_alias}'. Valid aliases are: {', '.join(FREQUENCY.keys())}{Style.RESET_ALL}")
+            continue
+            
+        app.add_source(name, url, actual_frequency)
+        count_added += 1
     
-    # IP Feeds - typically update less frequently
-    app.add_source("feodotracker_ipblocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", FREQUENCY["STANDARD"])
-    app.add_source("binarydefense", "https://www.binarydefense.com/banlist.txt", FREQUENCY["STANDARD"])
-    app.add_source("emergingthreats", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", FREQUENCY["STANDARD"])
-    app.add_source("cinsscore", "https://cinsscore.com/list/ci-badguys.txt", FREQUENCY["STANDARD"])
-    app.add_source("elliotech", "https://cdn.ellio.tech/community-feed", FREQUENCY["SLOW"])
-    app.add_source("stamparm", "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/6.txt", FREQUENCY["SLOW"])
-    app.add_source("mirai", "https://mirai.security.gives/data/ip_list.txt", FREQUENCY["STANDARD"])
-    
-    # IP CIDR Feeds - typically update less frequently
-    app.add_source("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt", FREQUENCY["SLOW"])
-    app.add_source("dshield", "https://dshield.org/block.txt", FREQUENCY["STANDARD"])
-    app.add_source("firehol", "https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset", FREQUENCY["DAILY"])
-    
-    # ThreatFox Feeds - contain recent threats, check frequently
-    app.add_source("threatfox_urls", "https://threatfox.abuse.ch/export/csv/urls/recent/", FREQUENCY["STANDARD"])
-    app.add_source("threatfox_domains", "https://threatfox.abuse.ch/export/csv/domains/recent/", FREQUENCY["STANDARD"])
-    app.add_source("threatfox_ip_port", "https://threatfox.abuse.ch/export/csv/ip-port/recent/", FREQUENCY["STANDARD"])
-    
-    logger.info(f"{Fore.GREEN}Added {16} default sources{Style.RESET_ALL}")
+    if count_added > 0:
+        logger.info(f"{Fore.GREEN}Successfully added {count_added} sources from {SOURCES_FILE_PATH}{Style.RESET_ALL}")
+    else:
+        logger.info(f"No sources were added from {SOURCES_FILE_PATH}.")

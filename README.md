@@ -30,8 +30,50 @@ threat_intel_collector/
 1. Clone the repository
 2. Install dependencies:
 ```
-pip install -r requirements.txt
+
+## Configuration
+
+### Database Name
+
+The name of the SQLite database file can be configured using the `THREAT_INTEL_DB_NAME` environment variable. If this variable is not set, it defaults to `threat_intel.db`.
+
+Example:
+```bash
+export THREAT_INTEL_DB_NAME="my_custom_threats.db"
+python -m threat_intel_collector.main
 ```
+
+### Threat Sources
+
+Threat sources are defined in `config/sources.json`. This file allows you to customize the list of threat intelligence feeds the application will use.
+
+The file should be an array of JSON objects, where each object represents a source and has the following properties:
+*   `"name"`: A unique name for the source (e.g., `"urlhaus_text"`).
+*   `"url"`: The URL of the threat feed.
+*   `"frequency_alias"`: A string representing how often the source should be checked. Valid aliases are:
+    *   `"QUICK"`: 5 minutes
+    *   `"STANDARD"`: 10 minutes
+    *   `"SLOW"`: 30 minutes
+    *   `"DAILY"`: 24 hours
+
+Example `config/sources.json`:
+```json
+[
+  {
+    "name": "urlhaus_text",
+    "url": "https://urlhaus.abuse.ch/downloads/text/",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "openphish",
+    "url": "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt",
+    "frequency_alias": "STANDARD"
+  }
+  // ... other sources
+]
+```
+
+If `config/sources.json` is missing or invalid, the application will log a warning and start without loading any sources from it.
 
 ## Usage
 
@@ -53,15 +95,7 @@ The application will:
 
 ## Adding Custom Sources
 
-You can add custom sources by modifying `config/sources.py` or by using the `add_source` method:
-
-```python
-app.add_source(
-    name="custom_source",
-    url="https://example.com/threats.txt",
-    frequency=FREQUENCY["STANDARD"]
-)
-```
+Previously, sources were added in `config/sources.py`. This method is now deprecated. Please use `config/sources.json` to manage your threat intelligence sources.
 
 ## Exported Data
 
@@ -74,6 +108,17 @@ The application exports data to the following files:
 ## Updated Threat Feeds Are Posted On My Website
 
 [joshsisto.com](https://joshsisto.com/projects.html)
+
+## Querying the Database
+
+A command-line tool, `tools/threat_query.py`, is provided to directly query the threat intelligence database.
+
+You can use it to perform various queries, such as retrieving all threats, filtering by type or source, or searching for specific indicators.
+
+To see the available options, run:
+```bash
+python tools/threat_query.py --help
+```
 
 ## License
 
