@@ -5,6 +5,7 @@ import time
 import logging
 import schedule
 import datetime
+import os
 from colorama import Fore, Style
 
 from database.db_manager import DatabaseManager
@@ -16,9 +17,10 @@ logger = logging.getLogger(__name__)
 class IntelligenceFeedApp:
     """Main application class that orchestrates the threat intelligence collection."""
 
-    def __init__(self, db_name="threat_intel.db"):
-        self.db_name = db_name
-        self.db_manager = DatabaseManager(db_name)
+    def __init__(self):
+        # Read database name from environment variable or use default
+        self.db_name = os.environ.get("THREAT_INTEL_DB_NAME", "threat_intel.db")
+        self.db_manager = DatabaseManager(self.db_name)
         self.exporter = FileExporter(self.db_manager)
         self.start_time = datetime.datetime.now()
         

@@ -1,0 +1,82 @@
+[
+  {
+    "name": "urlhaus_text",
+    "url": "https://urlhaus.abuse.ch/downloads/text/",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "openphish",
+    "url": "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "vxvault",
+    "url": "http://vxvault.net/URL_List.php",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "feodotracker_ipblocklist",
+    "url": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "binarydefense",
+    "url": "https://www.binarydefense.com/banlist.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "emergingthreats",
+    "url": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "cinsscore",
+    "url": "https://cinsscore.com/list/ci-badguys.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "elliotech",
+    "url": "https://cdn.ellio.tech/community-feed",
+    "frequency_alias": "SLOW"
+  },
+  {
+    "name": "stamparm",
+    "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/6.txt",
+    "frequency_alias": "SLOW"
+  },
+  {
+    "name": "mirai",
+    "url": "https://mirai.security.gives/data/ip_list.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "spamhaus_drop",
+    "url": "https://www.spamhaus.org/drop/drop.txt",
+    "frequency_alias": "SLOW"
+  },
+  {
+    "name": "dshield",
+    "url": "https://dshield.org/block.txt",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "firehol",
+    "url": "https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset",
+    "frequency_alias": "DAILY"
+  },
+  {
+    "name": "threatfox_urls",
+    "url": "https://threatfox.abuse.ch/export/csv/urls/recent/",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "threatfox_domains",
+    "url": "https://threatfox.abuse.ch/export/csv/domains/recent/",
+    "frequency_alias": "STANDARD"
+  },
+  {
+    "name": "threatfox_ip_port",
+    "url": "https://threatfox.abuse.ch/export/csv/ip-port/recent/",
+    "frequency_alias": "STANDARD"
+  }
+]
